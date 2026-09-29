@@ -15,7 +15,7 @@ import warnings
 from datetime import date, datetime
 from logging import getLogger, LoggerAdapter
 from operator import itemgetter
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from . import exceptions, imap4, response_lexer, tls
 from .datetime_util import datetime_to_INTERNALDATE, format_criteria_date
@@ -42,6 +42,7 @@ __all__ = [
     "FLAGGED",
     "DRAFT",
     "RECENT",
+    "ConditionalStoreResult",
 ]
 
 
@@ -164,6 +165,27 @@ class Quota:
     resource: str
     usage: bytes
     limit: bytes
+
+
+@dataclasses.dataclass
+class ConditionalStoreResult:
+    """Result of a CONDSTORE conditional STORE command.
+
+    :ivar flags: final flag values for messages in the command's message set
+        that were updated.
+    :ivar modified: message identifiers reported by the server's MODIFIED
+        response code. These are UIDs in UID mode and sequence numbers in
+        sequence mode.
+    :ivar unsolicited_flags: final flag values in unsolicited FETCH responses
+        for messages outside the command's message set.
+    :ivar use_uid: ``True`` when identifiers are UIDs, and ``False`` when they
+        are sequence numbers.
+    """
+
+    flags: Dict[int, Tuple[Any, ...]]
+    modified: Tuple[int, ...]
+    unsolicited_flags: Dict[int, Tuple[Any, ...]]
+    use_uid: bool
 
 
 def require_capability(capability):
@@ -1248,37 +1270,67 @@ class IMAPClient:
         response = self.fetch(messages, ["FLAGS"])
         return self._filter_fetch_dict(response, b"FLAGS")
 
-    def add_flags(self, messages, flags, silent=False):
+    def add_flags(self, messages, flags, silent=False, unchanged_since=None):
         """Add *flags* to *messages* in the currently selected folder.
 
         *flags* should be a sequence of strings.
 
-        Returns the flags set for each modified message (see
-        *get_flags*), or None if *silent* is true.
-        """
-        return self._store(b"+FLAGS", messages, flags, b"FLAGS", silent=silent)
+        Returns the flags set for each modified message (see *get_flags*),
+        or None if *silent* is true without *unchanged_since*.
 
-    def remove_flags(self, messages, flags, silent=False):
+        When *unchanged_since* is given, a CONDSTORE conditional STORE is
+        issued. The returned :class:`ConditionalStoreResult` contains the
+        updated messages, the identifiers in the MODIFIED response, and
+        unsolicited flag updates.
+        """
+        return self._store(
+            b"+FLAGS",
+            messages,
+            flags,
+            b"FLAGS",
+            silent=silent,
+            unchanged_since=unchanged_since,
+        )
+
+    def remove_flags(self, messages, flags, silent=False, unchanged_since=None):
         """Remove one or more *flags* from *messages* in the currently
         selected folder.
 
         *flags* should be a sequence of strings.
 
-        Returns the flags set for each modified message (see
-        *get_flags*), or None if *silent* is true.
-        """
-        return self._store(b"-FLAGS", messages, flags, b"FLAGS", silent=silent)
+        Returns the flags set for each modified message (see *get_flags*),
+        or None if *silent* is true without *unchanged_since*.
 
-    def set_flags(self, messages, flags, silent=False):
+        See :meth:`add_flags` for the meaning of *unchanged_since*.
+        """
+        return self._store(
+            b"-FLAGS",
+            messages,
+            flags,
+            b"FLAGS",
+            silent=silent,
+            unchanged_since=unchanged_since,
+        )
+
+    def set_flags(self, messages, flags, silent=False, unchanged_since=None):
         """Set the *flags* for *messages* in the currently selected
         folder.
 
         *flags* should be a sequence of strings.
 
-        Returns the flags set for each modified message (see
-        *get_flags*), or None if *silent* is true.
+        Returns the flags set for each modified message (see *get_flags*),
+        or None if *silent* is true without *unchanged_since*.
+
+        See :meth:`add_flags` for the meaning of *unchanged_since*.
         """
-        return self._store(b"FLAGS", messages, flags, b"FLAGS", silent=silent)
+        return self._store(
+            b"FLAGS",
+            messages,
+            flags,
+            b"FLAGS",
+            silent=silent,
+            unchanged_since=unchanged_since,
+        )
 
     def get_gmail_labels(self, messages):
         """Return the label set for each message in *messages* in the
@@ -1791,29 +1843,93 @@ class IMAPClient:
             else None
         )
 
-    def _store(self, cmd, messages, flags, fetch_key, silent):
+    def _store(self, cmd, messages, flags, fetch_key, silent, unchanged_since=None):
         """Worker function for the various flag manipulation methods.
 
         *cmd* is the STORE command to use (eg. '+FLAGS').
         """
         if not messages:
             return {}
+
+        if unchanged_since is not None:
+            valid_modseq = not isinstance(unchanged_since, bool) and isinstance(
+                unchanged_since, int
+            )
+            if not valid_modseq or unchanged_since < 0:
+                raise ValueError("'unchanged_since' must be a non-negative integer")
+            if not self.has_capability("CONDSTORE"):
+                raise exceptions.CapabilityError(
+                    "Server does not support CONDSTORE capability"
+                )
+
         if silent:
             cmd += b".SILENT"
 
-        data = self._command_and_check(
-            "store", join_message_ids(messages), cmd, seq_to_parenstr(flags), uid=True
+        message_set = join_message_ids(messages)
+        flag_values = seq_to_parenstr(flags)
+        modifier = (
+            "(UNCHANGEDSINCE %d)" % unchanged_since
+            if unchanged_since is not None
+            else None
         )
-        if silent:
-            return None
-        response = parse_fetch_response(data)
-        # Drop unsolicited responses for other messages
+
+        store_args = (message_set, cmd, flag_values)
+        if modifier is not None:
+            store_args += (modifier,)
+
+        untagged_responses = self._imap.untagged_responses
+        if unchanged_since is not None:
+            untagged_responses.pop("MODIFIED", None)
+
+        if unchanged_since is None:
+            data = self._command_and_check(
+                "store",
+                message_set,
+                cmd,
+                flag_values,
+                uid=True,
+            )
+            modified_data = None
+        else:
+            if self.use_uid:
+                typ, data = self._imap.uid("store", *store_args)
+            else:
+                typ, data = self._imap.store(*store_args)
+            modified_data = untagged_responses.pop("MODIFIED", None)
+            if typ != "OK" and not (typ == "NO" and modified_data is not None):
+                self._check_resp("OK", "store", typ, data)
+            if typ == "NO":
+                data = untagged_responses.pop("FETCH", [None])
+
+        response = parse_fetch_response(data, uid_is_key=self.use_uid)
+        requested_ids = set(to_ints(messages))
         without_unsolicited = {
             message_id: response[message_id]
-            for message_id in to_ints(messages)
+            for message_id in requested_ids
             if message_id in response
         }
-        return self._filter_fetch_dict(without_unsolicited, fetch_key)
+        flags_response = self._filter_fetch_dict(without_unsolicited, fetch_key)
+
+        if unchanged_since is None:
+            if silent:
+                return None
+            return flags_response
+
+        unsolicited = {
+            message_id: message_data
+            for message_id, message_data in response.items()
+            if message_id not in requested_ids and fetch_key in message_data
+        }
+
+        result = ConditionalStoreResult(
+            flags=flags_response,
+            modified=_parse_message_set(modified_data),
+            unsolicited_flags=self._filter_fetch_dict(unsolicited, fetch_key),
+            use_uid=self.use_uid,
+        )
+        if silent:
+            result.flags = {}
+        return result
 
     def _filter_fetch_dict(self, fetch_dict, key):
         return dict((msgid, data[key]) for msgid, data in fetch_dict.items())
@@ -1952,6 +2068,24 @@ def _maybe_int_to_bytes(val):
     if isinstance(val, int):
         return str(val).encode("us-ascii")
     return to_bytes(val)
+
+
+def _parse_message_set(data):
+    if not data:
+        return ()
+
+    message_set = b" ".join(to_bytes(part) for part in data).strip()
+    if not message_set:
+        return ()
+
+    ids = set()
+    for part in message_set.split(b","):
+        if b":" in part:
+            start, end = (int(value) for value in part.split(b":", 1))
+            ids.update(range(start, end + 1))
+        else:
+            ids.add(int(part))
+    return tuple(sorted(ids))
 
 
 def _parse_untagged_response(text):
