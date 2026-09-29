@@ -15,7 +15,7 @@ import warnings
 from datetime import date, datetime
 from logging import getLogger, LoggerAdapter
 from operator import itemgetter
-from typing import List, Optional
+from typing import Dict, FrozenSet, List, Optional
 
 from . import exceptions, imap4, response_lexer, tls
 from .datetime_util import datetime_to_INTERNALDATE, format_criteria_date
@@ -36,6 +36,8 @@ logger = getLogger(__name__)
 __all__ = [
     "IMAPClient",
     "SocketTimeout",
+    "SyncCheckpoint",
+    "FolderSyncResult",
     "DELETED",
     "SEEN",
     "ANSWERED",
@@ -164,6 +166,39 @@ class Quota:
     resource: str
     usage: bytes
     limit: bytes
+
+
+@dataclasses.dataclass
+class SyncCheckpoint:
+    """A folder synchronisation checkpoint.
+
+    :ivar uidvalidity: the folder's UIDVALIDITY at sync time
+    :ivar highestmodseq: the folder's HIGHESTMODSEQ at sync time, or
+        None if the server did not report one
+    """
+
+    uidvalidity: Optional[int]
+    highestmodseq: Optional[int]
+
+
+@dataclasses.dataclass
+class FolderSyncResult:
+    """The result of :py:meth:`.IMAPClient.sync_folder`.
+
+    :ivar changed: dict mapping the UIDs of new or modified messages
+        to their FETCH data (eg. ``b'FLAGS'`` and ``b'MODSEQ'``)
+    :ivar vanished: frozenset of UIDs expunged since the previous
+        checkpoint
+    :ivar checkpoint: the :py:class:`SyncCheckpoint` to use for the
+        next sync; it is only valid once the whole sync has succeeded
+    :ivar full_sync: True if a full (non-incremental)
+        synchronisation was performed
+    """
+
+    changed: Dict[int, dict]
+    vanished: FrozenSet[int]
+    checkpoint: SyncCheckpoint
+    full_sync: bool
 
 
 def require_capability(capability):
@@ -872,6 +907,119 @@ class IMAPClient:
                 value = tuple(value[0][1:-1].split())
             out[key] = value
         return out
+
+    def sync_folder(self, folder, uidvalidity, highestmodseq, known_uids):
+        """Synchronise *folder* against a previously saved checkpoint.
+
+        This is the QRESYNC (:rfc:`7162`) synchronisation entry
+        point. *uidvalidity* and *highestmodseq* should be the
+        UIDVALIDITY and HIGHESTMODSEQ values saved at the end of the
+        previous sync (the checkpoint) and *known_uids* the
+        collection of message UIDs known to exist in the folder at
+        that point.
+
+        A :py:class:`FolderSyncResult` is returned. Its *changed*
+        attribute maps the UIDs of new or modified messages to their
+        current FETCH data (flags and, when sent by the server,
+        MODSEQ). Its *vanished* attribute contains the UIDs of
+        messages that were expunged since the checkpoint. Its
+        *checkpoint* attribute holds the new checkpoint to use for
+        the next sync; it should only be stored once the returned
+        changes have been fully processed because it is only valid
+        for a completely successful sync.
+
+        If the server does not support QRESYNC (or *highestmodseq* is
+        None) a full synchronisation is performed instead: all
+        messages are fetched and compared against *known_uids*, and
+        the result's *full_sync* attribute is True.
+
+        If the folder's UIDVALIDITY has changed since the checkpoint,
+        all previously known UIDs are invalid: a full synchronisation
+        is performed and *vanished* is empty because the old UIDs no
+        longer refer to anything.
+
+        Unsolicited FETCH and VANISHED responses sent by the server
+        while the sync runs (for example changes made by other
+        clients) are collected and included in the result.
+
+        This method requires ``use_uid`` to be True (the default).
+        """
+        if not self.use_uid:
+            raise exceptions.IllegalStateError(
+                "sync_folder requires use_uid to be True"
+            )
+        known_uids = frozenset(int(uid) for uid in known_uids)
+        if highestmodseq is not None and self.has_capability("QRESYNC"):
+            return self._qresync_sync(folder, uidvalidity, highestmodseq, known_uids)
+        select_info = self.select_folder(folder)
+        return self._full_folder_sync(select_info, known_uids)
+
+    def _qresync_sync(self, folder, uidvalidity, highestmodseq, known_uids):
+        self.enable("QRESYNC")
+
+        params = [
+            str(uidvalidity).encode("ascii"),
+            str(highestmodseq).encode("ascii"),
+        ]
+        if known_uids:
+            params.append(_compress_uid_set(known_uids))
+        select_params = b"(QRESYNC (" + b" ".join(params) + b"))"
+
+        folder_arg = to_bytes(self._normalise_folder(folder))
+        self._imap.untagged_responses = {}  # flush, as imaplib's select does
+        typ, data = self._raw_command(
+            b"SELECT", [folder_arg, select_params], uid=False
+        )
+        if typ != "OK":
+            self._imap.state = "AUTH"
+        self._checkok("select", typ, data)
+        self._imap.state = "SELECTED"
+
+        untagged = self._imap.untagged_responses
+        select_info = self._process_select_response(untagged)
+        if select_info.get(b"UIDVALIDITY") != uidvalidity:
+            # UIDVALIDITY changed: all previously known UIDs are invalid.
+            return self._full_folder_sync(
+                select_info, known_uids, uidvalidity_changed=True
+            )
+
+        # Collect the (possibly unsolicited) FETCH and VANISHED
+        # responses sent while SELECT was executing.
+        changed = parse_fetch_response(
+            untagged.get("FETCH", []), self.normalise_times, uid_is_key=True
+        )
+        vanished = set()
+        for line in untagged.get("VANISHED", []):
+            vanished.update(_parse_vanished_uids(line))
+
+        checkpoint = SyncCheckpoint(
+            uidvalidity=uidvalidity,
+            highestmodseq=select_info.get(b"HIGHESTMODSEQ"),
+        )
+        return FolderSyncResult(
+            changed=dict(changed),
+            vanished=frozenset(vanished),
+            checkpoint=checkpoint,
+            full_sync=False,
+        )
+
+    def _full_folder_sync(self, select_info, known_uids, uidvalidity_changed=False):
+        uids = self.search()
+        changed = self.fetch(uids, ["FLAGS"]) if uids else {}
+        if uidvalidity_changed:
+            vanished = frozenset()
+        else:
+            vanished = frozenset(known_uids.difference(changed))
+        checkpoint = SyncCheckpoint(
+            uidvalidity=select_info.get(b"UIDVALIDITY"),
+            highestmodseq=select_info.get(b"HIGHESTMODSEQ"),
+        )
+        return FolderSyncResult(
+            changed=changed,
+            vanished=vanished,
+            checkpoint=checkpoint,
+            full_sync=True,
+        )
 
     def noop(self):
         """Execute the NOOP command.
@@ -1952,6 +2100,47 @@ def _maybe_int_to_bytes(val):
     if isinstance(val, int):
         return str(val).encode("us-ascii")
     return to_bytes(val)
+
+
+def _compress_uid_set(uids):
+    """Convert a collection of UIDs into a compressed IMAP
+    sequence-set (eg. ``b"41,43:2110,2212"``).
+    """
+    sorted_uids = sorted(uids)
+    ranges = []
+    range_start = range_end = sorted_uids[0]
+    for uid in sorted_uids[1:]:
+        if uid == range_end + 1:
+            range_end = uid
+        else:
+            ranges.append((range_start, range_end))
+            range_start = range_end = uid
+    ranges.append((range_start, range_end))
+    return b",".join(
+        str(start).encode("ascii") if start == end else b"%d:%d" % (start, end)
+        for start, end in ranges
+    )
+
+
+_RE_VANISHED = re.compile(rb"^(?:\(EARLIER\) )?(?P<uid_set>[0-9:,]+)$")
+
+
+def _parse_vanished_uids(line):
+    """Parse the payload of a VANISHED untagged response into a set of
+    UIDs. Both the ``(EARLIER)`` and plain forms are handled.
+    """
+    line = to_bytes(line).strip()
+    match = _RE_VANISHED.match(line)
+    if not match:
+        raise exceptions.ProtocolError("bad VANISHED response: %r" % line)
+    uids = set()
+    for part in match.group("uid_set").split(b","):
+        if b":" in part:
+            first, last = part.split(b":")
+            uids.update(range(int(first), int(last) + 1))
+        else:
+            uids.add(int(part))
+    return uids
 
 
 def _parse_untagged_response(text):
