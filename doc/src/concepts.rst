@@ -63,6 +63,14 @@ The ampersand character ("&") has special meaning in IMAP folder
 names. IMAPClient automatically escapes and unescapes this character
 so that the caller doesn't have to.
 
+If the server supports the ``UTF8=ACCEPT`` extension
+(:rfc:`6855`) and it has been activated with
+:py:meth:`.IMAPClient.enable`, folder names are sent and returned as
+UTF-8 instead of modified UTF-7 for the rest of the session. Folder
+names are still presented to the caller as unicode strings, so the
+change of wire encoding is transparent. If the server does not
+confirm ``UTF8=ACCEPT``, modified UTF-7 keeps being used.
+
 Automatic folder name encoding and decoding can be enabled or disabled
 with the *folder_encode* attribute. It defaults to True.
 
