@@ -5,6 +5,7 @@
 
 from unittest.mock import Mock, patch, sentinel
 
+from imapclient import exceptions
 from imapclient.imapclient import ANSWERED, DELETED, DRAFT, FLAGGED, RECENT, SEEN
 
 from .imapclient_test import IMAPClientTest
@@ -78,6 +79,155 @@ class TestFlags(IMAPClientTest):
             )
 
         cc.reset_mock()
+
+
+class TestCondstoreFlags(IMAPClientTest):
+    def setUp(self):
+        super(TestCondstoreFlags, self).setUp()
+        self.client._imap.capabilities = [b"IMAP4REV1", b"CONDSTORE"]
+        self.client._imap.uid = Mock()
+        self.client._imap.untagged_responses = {}
+
+    def mock_store_response(self, typ, tagged, fetch=None):
+        # Mirror imaplib: on OK the FETCH untagged responses are
+        # returned by uid(); on NO the tagged response text is
+        # returned and the FETCH responses stay buffered.
+        fetch = list(fetch or [])
+        if typ == "OK":
+            self.client._imap.uid.return_value = (typ, fetch)
+        else:
+            self.client._imap.uid.return_value = (typ, tagged)
+            self.client._imap.untagged_responses = {"FETCH": fetch}
+
+    def assert_store_command(self, expected_command, expected_flags="(foo)"):
+        self.client._imap.uid.assert_called_once_with(
+            "STORE",
+            b"1,2",
+            b"(UNCHANGEDSINCE 999)",
+            expected_command,
+            expected_flags,
+        )
+
+    def test_add_unchanged_since_success(self):
+        self.mock_store_response(
+            "OK",
+            [b"Store completed"],
+            fetch=[
+                b"11 (FLAGS (\\Seen foo) UID 1 MODSEQ (1000))",
+                b"22 (FLAGS (foo) UID 2 MODSEQ (1000))",
+            ],
+        )
+        resp, failed = self.client.add_flags([1, 2], "foo", unchanged_since=999)
+        self.assert_store_command(b"+FLAGS")
+        self.assertEqual(resp, {1: (b"\\Seen", b"foo"), 2: (b"foo",)})
+        self.assertEqual(failed, set())
+
+    def test_remove_unchanged_since(self):
+        self.mock_store_response("OK", [b"Store completed"])
+        resp, failed = self.client.remove_flags([1, 2], "foo", unchanged_since=999)
+        self.assert_store_command(b"-FLAGS")
+        self.assertEqual(resp, {})
+        self.assertEqual(failed, set())
+
+    def test_set_unchanged_since(self):
+        self.mock_store_response("OK", [b"Store completed"])
+        resp, failed = self.client.set_flags([1, 2], "foo", unchanged_since=999)
+        self.assert_store_command(b"FLAGS")
+        self.assertEqual(resp, {})
+        self.assertEqual(failed, set())
+
+    def test_unchanged_since_silent(self):
+        self.mock_store_response("OK", [b"Store completed"])
+        resp, failed = self.client.add_flags(
+            [1, 2], "foo", silent=True, unchanged_since=999
+        )
+        self.assert_store_command(b"+FLAGS.SILENT")
+        self.assertIsNone(resp)
+        self.assertEqual(failed, set())
+
+    def test_partial_conflict_returns_updated_and_failed(self):
+        # The server updated UID 1 but UID 2 was modified by another
+        # client: the update of UID 1 must not be lost and the
+        # conflict must not be reported as a total failure.
+        self.mock_store_response(
+            "NO",
+            [b"[MODIFIED 2] Conditional STORE failed"],
+            fetch=[b"11 (FLAGS (\\Seen foo) UID 1 MODSEQ (1001))"],
+        )
+        resp, failed = self.client.add_flags([1, 2], "foo", unchanged_since=999)
+        self.assertEqual(resp, {1: (b"\\Seen", b"foo")})
+        self.assertEqual(failed, {2})
+        # Buffered responses are drained so they cannot leak into
+        # later commands.
+        self.assertEqual(self.client._imap.untagged_responses, {})
+
+    def test_modified_response_with_ranges(self):
+        self.mock_store_response(
+            "NO",
+            [b"[MODIFIED 2,4:5] Conditional STORE failed"],
+            fetch=[b"11 (FLAGS (foo) UID 1 MODSEQ (1001))"],
+        )
+        resp, failed = self.client.set_flags([1, 2, 4, 5], "foo", unchanged_since=999)
+        self.assertEqual(resp, {1: (b"foo",)})
+        self.assertEqual(failed, {2, 4, 5})
+
+    def test_expunge_mid_update_does_not_confuse_conflict_report(self):
+        # The server expunges a message while the conditional STORE is
+        # in progress. Because UID mode is used, the MODIFIED report
+        # and the returned flags still refer to the right messages.
+        self.client._imap.uid.return_value = (
+            "NO",
+            [b"[MODIFIED 105,107] Conditional STORE failed"],
+        )
+        self.client._imap.untagged_responses = {
+            "FETCH": [
+                b"1 (UID 101 FLAGS (\\Seen) MODSEQ (917))",
+                b"3 (UID 103 FLAGS (\\Seen foo) MODSEQ (920))",
+            ],
+            "EXPUNGE": [b"2"],
+        }
+        resp, failed = self.client.add_flags(
+            [101, 103, 105, 107], "foo", unchanged_since=916
+        )
+        self.client._imap.uid.assert_called_once_with(
+            "STORE",
+            b"101,103,105,107",
+            b"(UNCHANGEDSINCE 916)",
+            b"+FLAGS",
+            "(foo)",
+        )
+        self.assertEqual(resp, {101: (b"\\Seen",), 103: (b"\\Seen", b"foo")})
+        self.assertEqual(failed, {105, 107})
+        self.assertEqual(self.client._imap.untagged_responses, {"EXPUNGE": [b"2"]})
+
+    def test_unchanged_since_requires_condstore(self):
+        self.client._imap.capabilities = [b"IMAP4REV1"]
+        self.assertRaises(
+            exceptions.CapabilityError,
+            self.client.add_flags,
+            [1, 2],
+            "foo",
+            unchanged_since=999,
+        )
+        self.client._imap.uid.assert_not_called()
+
+    def test_unchanged_since_requires_uid_mode(self):
+        self.client.use_uid = False
+        self.assertRaises(
+            exceptions.IMAPClientError,
+            self.client.add_flags,
+            [1, 2],
+            "foo",
+            unchanged_since=999,
+        )
+        self.client._imap.uid.assert_not_called()
+
+    def test_no_unchanged_since_keeps_old_return_type(self):
+        self.client._command_and_check = Mock(
+            return_value=[b"11 (FLAGS (foo) UID 1)"]
+        )
+        resp = self.client.add_flags([1], "foo")
+        self.assertEqual(resp, {1: (b"foo",)})
 
 
 class TestGmailLabels(IMAPClientTest):

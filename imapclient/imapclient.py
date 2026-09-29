@@ -1248,17 +1248,36 @@ class IMAPClient:
         response = self.fetch(messages, ["FLAGS"])
         return self._filter_fetch_dict(response, b"FLAGS")
 
-    def add_flags(self, messages, flags, silent=False):
+    def add_flags(self, messages, flags, silent=False, unchanged_since=None):
         """Add *flags* to *messages* in the currently selected folder.
 
         *flags* should be a sequence of strings.
 
         Returns the flags set for each modified message (see
         *get_flags*), or None if *silent* is true.
-        """
-        return self._store(b"+FLAGS", messages, flags, b"FLAGS", silent=silent)
 
-    def remove_flags(self, messages, flags, silent=False):
+        When *unchanged_since* is given, a conditional STORE is
+        performed (see :rfc:`7162`): only messages whose mod-sequence
+        is at most *unchanged_since* are updated. This requires the
+        server to support the ``CONDSTORE`` extension and the client
+        to be in UID mode (``use_uid=True``). In this mode a tuple
+        ``(flags, failed_uids)`` is returned, where *failed_uids* is
+        the set of UIDs the server left unchanged because they were
+        modified by another client.
+        """
+        response, failed_uids = self._store(
+            b"+FLAGS",
+            messages,
+            flags,
+            b"FLAGS",
+            silent=silent,
+            unchanged_since=unchanged_since,
+        )
+        if unchanged_since is None:
+            return response
+        return response, failed_uids
+
+    def remove_flags(self, messages, flags, silent=False, unchanged_since=None):
         """Remove one or more *flags* from *messages* in the currently
         selected folder.
 
@@ -1266,10 +1285,29 @@ class IMAPClient:
 
         Returns the flags set for each modified message (see
         *get_flags*), or None if *silent* is true.
-        """
-        return self._store(b"-FLAGS", messages, flags, b"FLAGS", silent=silent)
 
-    def set_flags(self, messages, flags, silent=False):
+        When *unchanged_since* is given, a conditional STORE is
+        performed (see :rfc:`7162`): only messages whose mod-sequence
+        is at most *unchanged_since* are updated. This requires the
+        server to support the ``CONDSTORE`` extension and the client
+        to be in UID mode (``use_uid=True``). In this mode a tuple
+        ``(flags, failed_uids)`` is returned, where *failed_uids* is
+        the set of UIDs the server left unchanged because they were
+        modified by another client.
+        """
+        response, failed_uids = self._store(
+            b"-FLAGS",
+            messages,
+            flags,
+            b"FLAGS",
+            silent=silent,
+            unchanged_since=unchanged_since,
+        )
+        if unchanged_since is None:
+            return response
+        return response, failed_uids
+
+    def set_flags(self, messages, flags, silent=False, unchanged_since=None):
         """Set the *flags* for *messages* in the currently selected
         folder.
 
@@ -1277,8 +1315,27 @@ class IMAPClient:
 
         Returns the flags set for each modified message (see
         *get_flags*), or None if *silent* is true.
+
+        When *unchanged_since* is given, a conditional STORE is
+        performed (see :rfc:`7162`): only messages whose mod-sequence
+        is at most *unchanged_since* are updated. This requires the
+        server to support the ``CONDSTORE`` extension and the client
+        to be in UID mode (``use_uid=True``). In this mode a tuple
+        ``(flags, failed_uids)`` is returned, where *failed_uids* is
+        the set of UIDs the server left unchanged because they were
+        modified by another client.
         """
-        return self._store(b"FLAGS", messages, flags, b"FLAGS", silent=silent)
+        response, failed_uids = self._store(
+            b"FLAGS",
+            messages,
+            flags,
+            b"FLAGS",
+            silent=silent,
+            unchanged_since=unchanged_since,
+        )
+        if unchanged_since is None:
+            return response
+        return response, failed_uids
 
     def get_gmail_labels(self, messages):
         """Return the label set for each message in *messages* in the
@@ -1782,7 +1839,7 @@ class IMAPClient:
         self._check_resp("OK", command, typ, data)
 
     def _gm_label_store(self, cmd, messages, labels, silent):
-        response = self._store(
+        response, _ = self._store(
             cmd, messages, self._normalise_labels(labels), b"X-GM-LABELS", silent=silent
         )
         return (
@@ -1791,21 +1848,35 @@ class IMAPClient:
             else None
         )
 
-    def _store(self, cmd, messages, flags, fetch_key, silent):
+    def _store(self, cmd, messages, flags, fetch_key, silent, unchanged_since=None):
         """Worker function for the various flag manipulation methods.
 
         *cmd* is the STORE command to use (eg. '+FLAGS').
+
+        Returns a tuple of the fetch response dictionary (or None if
+        *silent*) and the set of UIDs rejected by the server when
+        *unchanged_since* is used (None otherwise).
         """
         if not messages:
-            return {}
+            return {}, set()
         if silent:
             cmd += b".SILENT"
 
-        data = self._command_and_check(
-            "store", join_message_ids(messages), cmd, seq_to_parenstr(flags), uid=True
-        )
+        if unchanged_since is None:
+            data = self._command_and_check(
+                "store",
+                join_message_ids(messages),
+                cmd,
+                seq_to_parenstr(flags),
+                uid=True,
+            )
+            failed_uids = None
+        else:
+            data, failed_uids = self._condstore_store(
+                cmd, messages, flags, unchanged_since
+            )
         if silent:
-            return None
+            return None, failed_uids
         response = parse_fetch_response(data)
         # Drop unsolicited responses for other messages
         without_unsolicited = {
@@ -1813,7 +1884,50 @@ class IMAPClient:
             for message_id in to_ints(messages)
             if message_id in response
         }
-        return self._filter_fetch_dict(without_unsolicited, fetch_key)
+        return self._filter_fetch_dict(without_unsolicited, fetch_key), failed_uids
+
+    def _condstore_store(self, cmd, messages, flags, unchanged_since):
+        """Perform a conditional STORE (UNCHANGEDSINCE), see RFC 7162.
+
+        Returns a tuple of the untagged FETCH data and the set of UIDs
+        the server refused to update (from the MODIFIED response
+        code).
+        """
+        if not self.has_capability(b"CONDSTORE"):
+            raise exceptions.CapabilityError(
+                "The server does not support CONDSTORE: "
+                "unchanged_since cannot be used"
+            )
+        if not self.use_uid:
+            raise exceptions.IMAPClientError(
+                "unchanged_since requires UID mode (use_uid=True): in "
+                "sequence number mode the MODIFIED response cannot be "
+                "reliably mapped back to messages when other clients "
+                "expunge messages"
+            )
+        typ, data = self._imap.uid(
+            "STORE",
+            join_message_ids(messages),
+            b"(UNCHANGEDSINCE %d)" % unchanged_since,
+            cmd,
+            seq_to_parenstr(flags),
+        )
+        if typ == "NO":
+            # The conditional STORE partially failed. The tagged NO
+            # carries a MODIFIED response code listing the UIDs that
+            # were not updated, while the untagged FETCH responses
+            # for the messages that were updated (and any concurrent
+            # flag updates pushed by the server) are still buffered
+            # by imaplib.
+            failed_uids = _parse_modified_response(data[0] if data else b"")
+            # Drain the buffered responses so concurrent updates are
+            # neither lost nor leaked into later commands.
+            self._imap.untagged_responses.pop("MODIFIED", None)
+            data = self._imap.untagged_responses.pop("FETCH", [])
+        else:
+            self._checkok("store", typ, data)
+            failed_uids = set()
+        return data, failed_uids
 
     def _filter_fetch_dict(self, fetch_dict, key):
         return dict((msgid, data[key]) for msgid, data in fetch_dict.items())
@@ -1952,6 +2066,31 @@ def _maybe_int_to_bytes(val):
     if isinstance(val, int):
         return str(val).encode("us-ascii")
     return to_bytes(val)
+
+
+def _parse_modified_response(text):
+    """Parse the MODIFIED response code of a failed conditional STORE.
+
+    *text* is the tagged NO response text (eg. ``[MODIFIED 2,4:5]
+    Conditional STORE failed``). Returns the set of message UIDs that
+    the server refused to update. UIDs are used here (rather than
+    sequence numbers) so the result stays correct even if messages
+    were expunged while the STORE was in progress.
+    """
+    match = re.search(rb"\[MODIFIED\s+([^\]]+)\]", to_bytes(text))
+    if not match:
+        return set()
+    uids = set()
+    for part in match.group(1).split(b","):
+        part = part.strip()
+        if not part:
+            continue
+        if b":" in part:
+            first, last = part.split(b":", 1)
+            uids.update(range(int(first), int(last) + 1))
+        else:
+            uids.add(int(part))
+    return uids
 
 
 def _parse_untagged_response(text):
