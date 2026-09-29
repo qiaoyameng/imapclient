@@ -21,7 +21,13 @@ from . import exceptions, imap4, response_lexer, tls
 from .datetime_util import datetime_to_INTERNALDATE, format_criteria_date
 from .imap_utf7 import decode as decode_utf7
 from .imap_utf7 import encode as encode_utf7
-from .response_parser import parse_fetch_response, parse_message_list, parse_response
+from .response_parser import (
+    parse_esearch_response,
+    parse_fetch_response,
+    parse_message_list,
+    parse_response,
+)
+from .response_types import UidRanges
 from .util import assert_imap_protocol, chunk, to_bytes, to_ints, to_unicode
 
 if hasattr(select, "poll"):
@@ -1178,6 +1184,87 @@ class IMAPClient:
 
         return parse_message_list(data)
 
+    @require_capability("ESEARCH")
+    def esearch(self, criteria="ALL", charset=None, return_options=("ALL",)):
+        """Return extended search results for the currently selected
+        folder, using the ESEARCH extension (:rfc:`4731`).
+
+        Unlike :py:meth:`.search`, which always expands the result
+        into a list of message ids, this method uses ``SEARCH RETURN
+        (...)`` so that huge results (potentially millions of UIDs)
+        don't have to be materialised.
+
+        *criteria* and *charset* are as per :py:meth:`.search`.
+
+        *return_options* selects which return data items to request
+        from the server. It should be a non-empty sequence containing
+        one or more of ``"COUNT"``, ``"MIN"``, ``"MAX"`` and ``"ALL"``
+        (a single string is also accepted). It defaults to
+        ``("ALL",)``.
+
+        The return value is a dict containing the requested items:
+        ``COUNT``, ``MIN`` and ``MAX`` are ints, while ``ALL`` is a
+        :py:class:`UidRanges <imapclient.response_types.UidRanges>`
+        instance: a lazy, iterable set of UID ranges. Membership
+        tests, ``len()``, indexing and slicing on it are computed
+        arithmetically and never expand the ranges; only iteration
+        (``for`` loops, ``list()``, ``set()`` etc.) walks every UID.
+
+        The ``TAG`` correlator and ``UID`` indicator of the ESEARCH
+        response are validated so that a response belonging to another
+        command is never picked up by mistake. A
+        :py:class:`~imapclient.exceptions.ProtocolError` is raised if
+        they don't match this command.
+
+        Note that ESEARCH is an extension to the IMAP4 standard so it
+        may not be supported by all IMAP servers.
+        """
+        if isinstance(return_options, (str, bytes)):
+            return_options = (return_options,)
+        options = sorted({to_unicode(option).upper() for option in return_options})
+        unknown = set(options) - {"COUNT", "MIN", "MAX", "ALL"}
+        if unknown:
+            raise ValueError(
+                "unknown ESEARCH return options: %s" % ", ".join(sorted(unknown))
+            )
+        if not options:
+            raise ValueError("return_options must not be empty")
+
+        args = [b"RETURN", to_bytes("(" + " ".join(options) + ")")]
+        if charset:
+            args.extend([b"CHARSET", to_bytes(charset)])
+        args.extend(_normalise_search_criteria(criteria, charset))
+
+        tag = self._imap._new_tag()
+        typ, data = self._raw_command(b"SEARCH", args, tag=tag)
+        self._checkok("SEARCH", typ, data)
+
+        lines = self._imap.untagged_responses.pop("ESEARCH", [])
+        if isinstance(lines, (bytes, str)):
+            lines = [lines]
+        if not lines:
+            raise exceptions.ProtocolError("server did not return an ESEARCH response")
+
+        items = None
+        for line in lines:
+            resp_tag, uid_indicator, items = parse_esearch_response(line)
+            if resp_tag is not None and resp_tag != to_unicode(tag):
+                raise exceptions.ProtocolError(
+                    "ESEARCH response tag mismatch: expected %r, got %r"
+                    % (to_unicode(tag), resp_tag)
+                )
+            if uid_indicator != self.use_uid:
+                raise exceptions.ProtocolError(
+                    "ESEARCH response UID indicator mismatch: command was sent "
+                    "with use_uid=%r but response %s a UID indicator"
+                    % (self.use_uid, "includes" if uid_indicator else "lacks")
+                )
+
+        if "ALL" in options and "ALL" not in items:
+            # ALL is omitted by the server when no messages matched
+            items["ALL"] = UidRanges()
+        return items
+
     @require_capability("SORT")
     def sort(self, sort_criteria, criteria="ALL", charset="UTF-8"):
         """Return a list of message ids from the currently selected
@@ -1681,7 +1768,7 @@ class IMAPClient:
             return data[0]
         return data
 
-    def _raw_command(self, command, args, uid=True):
+    def _raw_command(self, command, args, uid=True, tag=None):
         """Run the specific command with the arguments given. 8-bit arguments
         are sent as literals. The return value is (typ, data).
 
@@ -1691,6 +1778,8 @@ class IMAPClient:
 
         *command* should be specified as bytes.
         *args* should be specified as a list of bytes.
+        *tag* may be used to specify the command tag. A fresh tag is
+        generated if not given.
         """
         command = command.upper()
 
@@ -1703,7 +1792,8 @@ class IMAPClient:
         if not isinstance(args, list):
             args = [args]
 
-        tag = self._imap._new_tag()
+        if tag is None:
+            tag = self._imap._new_tag()
         prefix = [to_bytes(tag)]
         if uid and self.use_uid:
             prefix.append(b"UID")

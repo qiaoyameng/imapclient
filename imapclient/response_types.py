@@ -4,8 +4,9 @@
 
 import dataclasses
 import datetime
+from bisect import bisect_right
 from email.utils import formataddr
-from typing import Any, List, Optional, Tuple, TYPE_CHECKING, Union
+from typing import Any, Iterable, Iterator, List, Optional, Tuple, TYPE_CHECKING, Union
 
 from .typing_imapclient import _Atom
 from .util import to_unicode
@@ -116,6 +117,128 @@ class SearchIds(List[int]):
     def __init__(self, *args: Any):
         super().__init__(*args)
         self.modseq: Optional[int] = None
+
+
+class UidRanges:
+    """A set of message UIDs stored as sorted, non-overlapping,
+    inclusive ``(start, end)`` ranges.
+
+    This is used for the ``ALL`` return data item of
+    :py:meth:`imapclient.IMAPClient.esearch` so that search results
+    containing millions of UIDs don't have to be expanded into
+    individual integers.
+
+    Ranges given to the constructor may be unsorted, overlapping or
+    reversed (eg. ``(8, 4)``); they are normalised and merged on
+    construction.
+
+    Membership tests (``uid in ranges``), ``len()``, integer indexing
+    and slicing are all performed arithmetically on the ranges and
+    never expand the set. Slices with a step of 1 (the default) return
+    another (lazy) :class:`UidRanges`; stepped slices return a list
+    containing only the selected UIDs.
+
+    Only iteration walks every UID. This includes ``for`` loops,
+    ``list()``, ``tuple()``, ``set()`` and anything else that consumes
+    the iterator. Avoid these on very large results.
+    """
+
+    __slots__ = ("_ranges", "_starts")
+
+    def __init__(self, ranges: Iterable[Tuple[int, int]] = ()) -> None:
+        normalised = []
+        for start, end in ranges:
+            start, end = int(start), int(end)
+            if start > end:
+                start, end = end, start
+            if start < 1:
+                raise ValueError("UIDs must be positive integers")
+            normalised.append((start, end))
+        normalised.sort()
+        merged: List[Tuple[int, int]] = []
+        for start, end in normalised:
+            if merged and start <= merged[-1][1] + 1:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        self._ranges = tuple(merged)
+        self._starts = tuple(start for start, _ in merged)
+
+    @property
+    def ranges(self) -> Tuple[Tuple[int, int], ...]:
+        """The stored ranges as a tuple of inclusive ``(start, end)`` pairs."""
+        return self._ranges
+
+    def __len__(self) -> int:
+        return sum(end - start + 1 for start, end in self._ranges)
+
+    def __bool__(self) -> bool:
+        return bool(self._ranges)
+
+    def __contains__(self, uid: object) -> bool:
+        if not isinstance(uid, int):
+            return False
+        idx = bisect_right(self._starts, uid)
+        if idx == 0:
+            return False
+        start, end = self._ranges[idx - 1]
+        return start <= uid <= end
+
+    def _uid_at(self, pos: int) -> int:
+        for start, end in self._ranges:
+            range_len = end - start + 1
+            if pos < range_len:
+                return start + pos
+            pos -= range_len
+        raise IndexError("UidRanges index out of range")
+
+    def __getitem__(
+        self, item: Union[int, slice]
+    ) -> Union[int, List[int], "UidRanges"]:
+        if isinstance(item, slice):
+            start, stop, step = item.indices(len(self))
+            if step != 1:
+                return [self._uid_at(pos) for pos in range(start, stop, step)]
+            return self._clip(start, stop)
+        pos = item
+        if pos < 0:
+            pos += len(self)
+        if pos < 0:
+            raise IndexError("UidRanges index out of range")
+        return self._uid_at(pos)
+
+    def _clip(self, lo: int, hi: int) -> "UidRanges":
+        """Return the UIDs at positions in ``[lo, hi)`` as a new UidRanges."""
+        clipped = []
+        pos = 0
+        for start, end in self._ranges:
+            range_lo = pos
+            pos += end - start + 1
+            overlap_lo, overlap_hi = max(lo, range_lo), min(hi, pos)
+            if overlap_lo < overlap_hi:
+                clipped.append(
+                    (start + overlap_lo - range_lo, start + overlap_hi - range_lo - 1)
+                )
+        return UidRanges(clipped)
+
+    def __iter__(self) -> Iterator[int]:
+        for start, end in self._ranges:
+            yield from range(start, end + 1)
+
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, UidRanges):
+            return NotImplemented
+        return self._ranges == other._ranges
+
+    def __ne__(self, other: object) -> bool:
+        eq = self.__eq__(other)
+        return eq if eq is NotImplemented else not eq
+
+    def __hash__(self) -> int:
+        return hash(self._ranges)
+
+    def __repr__(self) -> str:
+        return "%s(%r)" % (type(self).__name__, list(self._ranges))
 
 
 _BodyDataType = Tuple[Union[bytes, int, "BodyData"], "_BodyDataType"]

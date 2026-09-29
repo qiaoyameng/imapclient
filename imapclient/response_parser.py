@@ -20,10 +20,10 @@ from typing import cast, Dict, Iterator, List, Optional, Tuple, TYPE_CHECKING, U
 from .datetime_util import parse_to_datetime
 from .exceptions import ProtocolError
 from .response_lexer import TokenSource
-from .response_types import Address, BodyData, Envelope, SearchIds
+from .response_types import Address, BodyData, Envelope, SearchIds, UidRanges
 from .typing_imapclient import _Atom
 
-__all__ = ["parse_response", "parse_message_list"]
+__all__ = ["parse_response", "parse_message_list", "parse_esearch_response"]
 
 
 def parse_response(data: List[bytes]) -> Tuple[_Atom, ...]:
@@ -82,6 +82,74 @@ def parse_message_list(data: List[Union[bytes, str]]) -> SearchIds:
             elif isinstance(item, int):
                 ids.append(item)
     return ids
+
+
+_esearch_tag_pattern = re.compile(r'\(TAG "(?P<tag>[^"]+)"\)')
+
+
+def parse_esearch_response(
+    data: Union[bytes, str],
+) -> Tuple[Optional[str], bool, Dict[str, Union[int, UidRanges]]]:
+    """Parse a single untagged ESEARCH response (RFC 4731).
+
+    *data* is the response text after the ``* ESEARCH`` marker, as
+    stored in imaplib's ``untagged_responses``.
+
+    Returns a ``(tag, uid_indicator, items)`` tuple where *tag* is the
+    command tag from the ``(TAG "...")`` correlator (or None if the
+    server omitted it), *uid_indicator* is True if the ``UID``
+    indicator was present, and *items* is a dict with ``COUNT``,
+    ``MIN``, ``MAX`` and/or ``ALL`` keys. ``ALL`` values are
+    :class:`UidRanges` instances so large results are not expanded.
+    """
+    if isinstance(data, bytes):
+        data = data.decode("ascii")
+    data = data.strip()
+
+    tag = None
+    tag_match = _esearch_tag_pattern.match(data)
+    if tag_match:
+        tag = tag_match.group("tag")
+        data = data[tag_match.end() :].lstrip()
+
+    tokens = data.split()
+    uid_indicator = False
+    if tokens and tokens[0].upper() == "UID":
+        uid_indicator = True
+        tokens = tokens[1:]
+
+    items: Dict[str, Union[int, UidRanges]] = {}
+    idx = 0
+    while idx < len(tokens):
+        key = tokens[idx].upper()
+        value = tokens[idx + 1] if idx + 1 < len(tokens) else None
+        if key in ("MIN", "MAX", "COUNT"):
+            if value is None or not value.isdigit():
+                raise ProtocolError("malformed ESEARCH %s value: %r" % (key, value))
+            items[key] = int(value)
+        elif key == "ALL":
+            if value is None:
+                raise ProtocolError("missing ESEARCH ALL value")
+            items[key] = _parse_esearch_seq_set(value)
+        else:
+            raise ProtocolError("unexpected ESEARCH return data: %r" % tokens[idx])
+        idx += 2
+
+    return tag, uid_indicator, items
+
+
+def _parse_esearch_seq_set(text: str) -> UidRanges:
+    ranges = []
+    for part in text.split(","):
+        if ":" in part:
+            first, _, last = part.partition(":")
+        else:
+            first = last = part
+        if not (first.isdigit() and last.isdigit()):
+            # "*" can't be resolved to a concrete UID here
+            raise ProtocolError("unsupported ESEARCH ALL sequence-set: %r" % text)
+        ranges.append((int(first), int(last)))
+    return UidRanges(ranges)
 
 
 def gen_parsed_response(text: List[bytes]) -> Iterator[_Atom]:
