@@ -10,6 +10,9 @@ IMAPClient instance.
 .. autoclass:: imapclient.SocketTimeout
    :members:
 
+.. autoclass:: imapclient.FolderSyncResult
+   :members:
+
 Fetch Response Types
 ~~~~~~~~~~~~~~~~~~~~
 Various types may be used in the data structures returned by

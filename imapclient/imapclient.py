@@ -15,7 +15,7 @@ import warnings
 from datetime import date, datetime
 from logging import getLogger, LoggerAdapter
 from operator import itemgetter
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from . import exceptions, imap4, response_lexer, tls
 from .datetime_util import datetime_to_INTERNALDATE, format_criteria_date
@@ -36,6 +36,7 @@ logger = getLogger(__name__)
 __all__ = [
     "IMAPClient",
     "SocketTimeout",
+    "FolderSyncResult",
     "DELETED",
     "SEEN",
     "ANSWERED",
@@ -164,6 +165,48 @@ class Quota:
     resource: str
     usage: bytes
     limit: bytes
+
+
+@dataclasses.dataclass
+class FolderSyncResult:
+    """The outcome of a folder synchronisation.
+
+    See :py:meth:`IMAPClient.sync_folder`.
+
+    :ivar fetch: mapping of message UID to FETCH data for the
+        messages that were created or changed since the previous
+        checkpoint. When *full_sync* or *uidvalidity_changed* is
+        True this contains every message currently in the folder.
+    :ivar vanished: sorted list of previously known UIDs that no
+        longer exist on the server. This is always empty when
+        *uidvalidity_changed* is True because old UIDs are
+        meaningless in that case.
+    :ivar uidvalidity: the UIDVALIDITY checkpoint to pass to the next
+        :py:meth:`IMAPClient.sync_folder` call.
+    :ivar highestmodseq: the HIGHESTMODSEQ checkpoint to pass to the
+        next call, or ``None`` when the server does not support
+        modsequences for the folder.
+    :ivar full_sync: True when a full synchronisation was performed
+        because the server does not support QRESYNC or no checkpoint
+        was supplied.
+    :ivar uidvalidity_changed: True when the server's UIDVALIDITY
+        differs from the one passed in. All previously known UIDs are
+        invalid and the local cache for the folder must be rebuilt
+        from *fetch*.
+    """
+
+    fetch: Dict[int, dict]
+    vanished: List[int]
+    uidvalidity: Optional[int]
+    highestmodseq: Optional[int]
+    full_sync: bool
+    uidvalidity_changed: bool
+
+    @property
+    def checkpoint(self):
+        """The ``(uidvalidity, highestmodseq)`` pair to save and pass
+        to the next :py:meth:`IMAPClient.sync_folder` call."""
+        return (self.uidvalidity, self.highestmodseq)
 
 
 def require_capability(capability):
@@ -872,6 +915,194 @@ class IMAPClient:
                 value = tuple(value[0][1:-1].split())
             out[key] = value
         return out
+
+    def sync_folder(self, folder, uidvalidity=None, highestmodseq=None, known_uids=()):
+        """Synchronise *folder* against a previously saved checkpoint.
+
+        This is the recommended way to keep a local cache of a folder
+        up to date. The caller passes the checkpoint saved from the
+        previous sync:
+
+        * *uidvalidity*: the UIDVALIDITY from the previous sync, or
+          ``None`` when there is no previous checkpoint.
+        * *highestmodseq*: the highest MODSEQ from the previous sync,
+          or ``None`` when unknown.
+        * *known_uids*: the message UIDs currently present in the
+          local cache.
+
+        When the server supports QRESYNC (:rfc:`7162`) and a complete
+        checkpoint is supplied, an incremental synchronisation is
+        performed: QRESYNC is enabled and the folder is selected with
+        the ``QRESYNC`` select parameter so the server only reports
+        what changed since the checkpoint. All ``FETCH`` and
+        ``VANISHED`` responses received while syncing are collected,
+        including unsolicited ones caused by other clients.
+
+        When QRESYNC is not available, or no complete checkpoint was
+        supplied, a full synchronisation is performed instead: every
+        message is fetched and vanished UIDs are computed locally.
+        The result has *full_sync* set to True in this case.
+
+        A :py:class:`FolderSyncResult` is returned. The new checkpoint
+        (``result.checkpoint``) should only be stored once the
+        returned changes have been fully applied locally: if any
+        error occurs during the sync an exception is raised and no
+        new checkpoint is produced.
+
+        If the server reports a UIDVALIDITY different from the one
+        passed in, all previously known UIDs are invalid:
+        *uidvalidity_changed* is True, *vanished* is empty and
+        *fetch* contains every message the server reported, so the
+        local cache can be rebuilt from scratch.
+
+        *use_uid* must be True (the default) to use this method.
+        """
+        if not self.use_uid:
+            raise ValueError("sync_folder requires use_uid=True")
+        known_uids = set(to_ints(known_uids))
+        if (
+            uidvalidity is not None
+            and highestmodseq is not None
+            and self.has_capability("QRESYNC")
+            and self.has_capability("ENABLE")
+        ):
+            result = self._qresync_sync(folder, uidvalidity, highestmodseq, known_uids)
+            if result is not None:
+                return result
+            # The server refused to ENABLE QRESYNC: fall back to a
+            # full synchronisation.
+        return self._full_folder_sync(folder, uidvalidity, known_uids)
+
+    def _qresync_sync(self, folder, uidvalidity, highestmodseq, known_uids):
+        """Incremental sync using QRESYNC. Returns a FolderSyncResult,
+        or None when the server would not enable QRESYNC."""
+        if self._imap.state == "AUTH":
+            enabled = self.enable("QRESYNC")
+            if b"QRESYNC" not in {to_bytes(c).upper() for c in enabled}:
+                logger.debug("Server refused to ENABLE QRESYNC")
+                return None
+        # Otherwise a folder is already selected and ENABLE is no
+        # longer legal: assume QRESYNC was enabled earlier in this
+        # session (eg. by a previous sync_folder call).
+
+        if known_uids:
+            select_param = b"(QRESYNC (%d %d %s))" % (
+                uidvalidity,
+                highestmodseq,
+                join_message_ids(sorted(known_uids)),
+            )
+        else:
+            select_param = b"(QRESYNC (%d %d))" % (uidvalidity, highestmodseq)
+
+        self._imap.is_readonly = False
+        tag = self._imap._command(
+            "SELECT", self._normalise_folder(folder), select_param
+        )
+        try:
+            fetch_lines, vanished, codes = self._consume_qresync_select(tag)
+        except Exception:
+            self._imap.state = "AUTH"
+            raise
+        self._imap.state = "SELECTED"
+
+        if b"UIDVALIDITY" not in codes:
+            raise exceptions.ProtocolError(
+                "server did not send UIDVALIDITY for SELECT"
+            )
+        new_uidvalidity = int(codes[b"UIDVALIDITY"])
+
+        if fetch_lines:
+            fetch = dict(parse_fetch_response(fetch_lines, self.normalise_times, True))
+        else:
+            fetch = {}
+
+        if b"NOMODSEQ" in codes:
+            new_modseq = None
+        else:
+            modseqs = [_fetch_modseq(data) for data in fetch.values()]
+            if b"HIGHESTMODSEQ" in codes:
+                modseqs.append(int(codes[b"HIGHESTMODSEQ"]))
+            modseqs = [modseq for modseq in modseqs if modseq is not None]
+            new_modseq = max(modseqs) if modseqs else None
+
+        uidvalidity_changed = new_uidvalidity != uidvalidity
+        return FolderSyncResult(
+            fetch=fetch,
+            vanished=[] if uidvalidity_changed else sorted(vanished),
+            uidvalidity=new_uidvalidity,
+            highestmodseq=new_modseq,
+            full_sync=False,
+            uidvalidity_changed=uidvalidity_changed,
+        )
+
+    def _consume_qresync_select(self, tag):
+        """Consume server responses until the tagged response for *tag*
+        arrives, collecting FETCH lines, VANISHED UIDs and response
+        codes from both untagged and tagged responses."""
+        tagged_commands = self._imap.tagged_commands
+        fetch_lines = []
+        vanished = set()
+        codes = {}
+        while True:
+            line = self._imap._get_response()
+            if tagged_commands.get(tag):
+                break
+            assert_imap_protocol(line is not None and line.startswith(b"* "), line)
+            body = line[2:]
+            upper = body.upper()
+            fetch_match = _RE_UNTAGGED_FETCH.match(body)
+            if fetch_match:
+                # Normalise to the imaplib style ("3 (FLAGS ...)")
+                # expected by parse_fetch_response.
+                fetch_lines.append(
+                    body[: fetch_match.end(1)] + b" " + body[fetch_match.end() :]
+                )
+            elif upper.startswith(b"VANISHED"):
+                match = _RE_UNTAGGED_VANISHED.match(body)
+                assert_imap_protocol(match is not None, body)
+                vanished.update(_expand_uid_set(match.group("uids")))
+            elif upper.startswith((b"OK ", b"NO ", b"BAD ")):
+                code = _parse_response_code(body[3:])
+                if code:
+                    codes[code[0]] = code[1]
+            elif upper.startswith(b"BYE"):
+                raise exceptions.IMAPClientAbortError(
+                    "Server said BYE: %s" % to_unicode(body)
+                )
+            # Other untagged responses (EXISTS, RECENT, FLAGS, ...)
+            # carry no information needed for synchronisation.
+        typ, data = tagged_commands.pop(tag)
+        self._checkok("select", typ, data)
+        code = _parse_response_code(data[0] if data else b"")
+        if code:
+            codes[code[0]] = code[1]
+        return fetch_lines, vanished, codes
+
+    def _full_folder_sync(self, folder, uidvalidity, known_uids):
+        """Full sync fallback used when QRESYNC is unavailable."""
+        select_info = self.select_folder(folder)
+        new_uidvalidity = select_info.get(b"UIDVALIDITY")
+        if new_uidvalidity is None:
+            raise exceptions.ProtocolError(
+                "server did not send UIDVALIDITY for SELECT"
+            )
+        if select_info.get(b"EXISTS"):
+            fetch = self.fetch("1:*", [b"FLAGS"])
+        else:
+            fetch = {}
+        uidvalidity_changed = uidvalidity is None or new_uidvalidity != uidvalidity
+        if uidvalidity_changed:
+            vanished = []
+        else:
+            vanished = sorted(known_uids - set(fetch))
+        return FolderSyncResult(
+            fetch=fetch,
+            vanished=vanished,
+            uidvalidity=new_uidvalidity,
+            highestmodseq=select_info.get(b"HIGHESTMODSEQ"),
+            full_sync=True,
+            uidvalidity_changed=uidvalidity_changed,
+        )
 
     def noop(self):
         """Execute the NOOP command.
@@ -1960,6 +2191,54 @@ def _parse_untagged_response(text):
     if text.startswith((b"OK ", b"NO ")):
         return tuple(text.split(b" ", 1))
     return parse_response([text])
+
+
+_RE_UNTAGGED_FETCH = re.compile(rb"([0-9]+) FETCH ", re.IGNORECASE)
+_RE_UNTAGGED_VANISHED = re.compile(
+    rb"VANISHED(?: +\(EARLIER\))? +(?P<uids>[0-9:,]+) *$", re.IGNORECASE
+)
+_RE_RESPONSE_CODE = re.compile(
+    rb"\[(?P<key>[A-Z0-9-]+)(?: +(?P<data>[^\]]+))?\]", re.IGNORECASE
+)
+
+
+def _parse_response_code(text):
+    """Extract a response code (eg. ``[HIGHESTMODSEQ 100]``) from the
+    start of an OK/NO/BAD response text.
+
+    Returns a ``(key, data)`` tuple of bytes, or None when the text
+    does not start with a response code.
+    """
+    if not text:
+        return None
+    match = _RE_RESPONSE_CODE.match(to_bytes(text))
+    if not match:
+        return None
+    return match.group("key").upper(), match.group("data")
+
+
+def _expand_uid_set(uid_set):
+    """Expand an IMAP UID set (eg. ``b"2:4,7"``) into a set of ints."""
+    uids = set()
+    for part in uid_set.split(b","):
+        if b":" in part:
+            first, last = part.split(b":", 1)
+            low, high = int(first), int(last)
+            uids.update(range(min(low, high), max(low, high) + 1))
+        else:
+            uids.add(int(part))
+    return uids
+
+
+def _fetch_modseq(msg_data):
+    """Return the integer MODSEQ of a parsed FETCH response item, or
+    None when the item carries no MODSEQ."""
+    value = msg_data.get(b"MODSEQ")
+    if isinstance(value, (tuple, list)):
+        value = value[0] if value else None
+    if value is None:
+        return None
+    return int(value)
 
 
 def as_pairs(items):
