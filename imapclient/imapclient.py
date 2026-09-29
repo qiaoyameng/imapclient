@@ -274,6 +274,10 @@ class IMAPClient:
         self.use_uid = use_uid
         self.folder_encode = True
         self.normalise_times = True
+        # Whether the server has accepted UTF-8 mode via
+        # ENABLE UTF8=ACCEPT (RFC 6855). When active, folder names are
+        # exchanged as UTF-8 instead of modified UTF-7.
+        self._utf8_enabled = False
 
         # If the user gives a single timeout value, assume it is the same for
         # connection and read/write operations
@@ -549,6 +553,10 @@ class IMAPClient:
         A list of the requested extensions that were successfully
         enabled on the server is returned.
 
+        If ``UTF8=ACCEPT`` is successfully enabled, folder names are
+        sent to and received from the server as UTF-8 instead of
+        modified UTF-7 for the rest of the session.
+
         Once enabled each extension remains active until the IMAP
         connection is closed.
 
@@ -568,7 +576,15 @@ class IMAPClient:
         )
         if not resp:
             return []
-        return resp.split()
+        enabled = resp.split()
+        if b"UTF8=ACCEPT" in [capability.upper() for capability in enabled]:
+            # The server accepted UTF-8 mode: folder names are now
+            # exchanged as UTF-8 rather than modified UTF-7. Switch
+            # imaplib over as well so that the whole session is
+            # consistent.
+            self._utf8_enabled = True
+            self._imap._mode_utf8()
+        return enabled
 
     @require_capability("ID")
     def id_(self, parameters=None):
@@ -671,7 +687,10 @@ class IMAPClient:
                 converted = []
                 for prefix, separator in item:
                     if self.folder_encode:
-                        prefix = decode_utf7(prefix)
+                        if self._utf8_enabled and isinstance(prefix, bytes):
+                            prefix = prefix.decode("utf-8")
+                        else:
+                            prefix = decode_utf7(prefix)
                     converted.append((prefix, to_unicode(separator)))
                 parts.append(tuple(converted))
         return Namespace(*parts)
@@ -743,7 +762,14 @@ class IMAPClient:
     def _do_list(self, cmd, directory, pattern):
         directory = self._normalise_folder(directory)
         pattern = self._normalise_folder(pattern)
-        typ, dat = self._imap._simple_command(cmd, directory, pattern)
+        if _needs_literal(directory) or _needs_literal(pattern):
+            # UTF-8 folder names have to be sent as literals, which
+            # imaplib can't do for arbitrary commands.
+            typ, dat = self._raw_command(
+                to_bytes(cmd), [directory, pattern], uid=False
+            )
+        else:
+            typ, dat = self._imap._simple_command(cmd, directory, pattern)
         self._checkok(cmd, typ, dat)
         typ, dat = self._imap._untagged_response(typ, dat, cmd)
         return self._proc_folder_list(dat)
@@ -763,7 +789,11 @@ class IMAPClient:
                 # back to strings.
                 name = str(name)
             elif self.folder_encode:
-                name = decode_utf7(name)
+                if self._utf8_enabled:
+                    if isinstance(name, bytes):
+                        name = name.decode("utf-8")
+                else:
+                    name = decode_utf7(name)
 
             ret.append((flags, delim, name))
         return ret
@@ -1767,7 +1797,21 @@ class IMAPClient:
     def _command_and_check(
         self, command, *args, unpack: bool = False, uid: bool = False
     ):
-        if uid and self.use_uid:
+        if any(_needs_literal(arg) for arg in args):
+            # 8-bit arguments (e.g. UTF-8 folder names when UTF8=ACCEPT
+            # is enabled) have to be sent as literals, which imaplib
+            # can't do for arbitrary commands.
+            raw_args = []
+            for arg in args:
+                if isinstance(arg, bool):
+                    # Mirror imaplib's select(): readonly selects use
+                    # the EXAMINE command instead of SELECT.
+                    if arg:
+                        command = "examine"
+                    continue
+                raw_args.append(to_bytes(arg))
+            typ, data = self._raw_command(to_bytes(command), raw_args, uid=uid)
+        elif uid and self.use_uid:
             command = to_unicode(command)  # imaplib must die
             typ, data = self._imap.uid(command, *args)
         else:
@@ -1822,6 +1866,10 @@ class IMAPClient:
         if isinstance(folder_name, bytes):
             folder_name = folder_name.decode("ascii")
         if self.folder_encode:
+            if self._utf8_enabled:
+                # UTF8=ACCEPT is active: folder names are sent as
+                # UTF-8, using a quoted string or literal as needed.
+                return _quoted.maybe(folder_name.encode("utf-8"))
             folder_name = encode_utf7(folder_name)
         return _quote(folder_name)
 
@@ -1980,6 +2028,10 @@ def as_triplets(items):
 
 def _is8bit(data):
     return isinstance(data, _literal) or any(b > 127 for b in data)
+
+
+def _needs_literal(arg):
+    return isinstance(arg, bytes) and _is8bit(arg)
 
 
 def _iter_with_last(items):

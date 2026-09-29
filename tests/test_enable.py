@@ -67,3 +67,48 @@ class TestEnable(IMAPClientTest):
             self.client.enable,
             "FOO",
         )
+
+    def test_utf8_accept_enabled(self):
+        self.command.return_value = b"UTF8=ACCEPT"
+
+        resp = self.client.enable("UTF8=ACCEPT")
+
+        self.assertEqual(resp, [b"UTF8=ACCEPT"])
+        self.assertTrue(self.client._utf8_enabled)
+        self.client._imap._mode_utf8.assert_called_once_with()
+
+    def test_utf8_accept_enabled_case_insensitive(self):
+        self.command.return_value = b"utf8=accept"
+
+        resp = self.client.enable("UTF8=ACCEPT")
+
+        self.assertEqual(resp, [b"utf8=accept"])
+        self.assertTrue(self.client._utf8_enabled)
+        self.client._imap._mode_utf8.assert_called_once_with()
+
+    def test_utf8_accept_refused(self):
+        # When the server returns an empty ENABLED response the
+        # session must stay in modified UTF-7 mode.
+        self.command.return_value = b""
+
+        resp = self.client.enable("UTF8=ACCEPT")
+
+        self.assertEqual(resp, [])
+        self.assertFalse(self.client._utf8_enabled)
+        self.client._imap._mode_utf8.assert_not_called()
+
+    def test_utf8_accept_not_in_response(self):
+        # When the server enables something else, UTF-8 mode must not
+        # be activated.
+        self.command.return_value = b"CONDSTORE"
+
+        resp = self.client.enable("CONDSTORE")
+
+        self.assertEqual(resp, [b"CONDSTORE"])
+        self.assertFalse(self.client._utf8_enabled)
+        self.client._imap._mode_utf8.assert_not_called()
+
+    def test_utf8_accept_not_enabled_by_default(self):
+        # A fresh connection never inherits UTF-8 mode from a
+        # previous session.
+        self.assertFalse(self.client._utf8_enabled)

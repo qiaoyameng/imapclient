@@ -70,6 +70,12 @@ If *folder_encode* is True, all folder names returned by IMAPClient
 are always returned as unicode strings. If *folder_encode* is False,
 folder names are returned as str (Python 2) or bytes (Python 3).
 
+If the server supports the ``UTF8=ACCEPT`` extension (:rfc:`6855`) it
+can be activated with ``client.enable("UTF8=ACCEPT")``. Once enabled,
+folder names are exchanged with the server as UTF-8 instead of
+modified UTF-7. This is handled transparently: folder names are still
+passed to and returned by IMAPClient as unicode strings.
+
 Working With Fetched Messages
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 The IMAP protocol gives access to a limited amount of information about emails
