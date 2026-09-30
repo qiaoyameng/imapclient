@@ -36,6 +36,7 @@ logger = getLogger(__name__)
 __all__ = [
     "IMAPClient",
     "SocketTimeout",
+    "FetchLiteralChunk",
     "DELETED",
     "SEEN",
     "ANSWERED",
@@ -108,6 +109,23 @@ _POPULAR_SPECIAL_FOLDERS = {
 
 _RE_SELECT_RESPONSE = re.compile(rb"\[(?P<key>[A-Z-]+)( \((?P<data>.*)\))?\]")
 
+# Matches the literal marker ({size}) at the very end of a response line.
+_RE_LITERAL_END = re.compile(rb"\{(?P<size>\d+)\}\r\n$")
+
+# Matches a FETCH data item name (eg. BODY[1], RFC822, BODY[HEADER.FIELDS
+# (FROM TO)]) immediately followed by a literal marker at the end of a
+# response line. Also captures the optional <origin> octet offset of
+# partial BODY[...]<origin> responses.
+_RE_FETCH_LITERAL_TAIL = re.compile(
+    rb"(?P<section>[A-Za-z0-9.]+(?:\[[^\]\r\n]*\])?)"
+    rb"(?:<(?P<origin>\d+)>)?"
+    rb"[ ]+\{(?P<size>\d+)\}\r\n$"
+)
+
+_RE_FETCH_SEQ = re.compile(rb"^\*[ ]+(?P<seq>\d+)[ ]+FETCH[ ]*\(", re.IGNORECASE)
+
+_RE_FETCH_UID = re.compile(rb"(?:^|[ (])UID[ ]+(?P<uid>\d+)", re.IGNORECASE)
+
 
 class Namespace(tuple):
     def __new__(cls, personal, other, shared):
@@ -132,6 +150,29 @@ class SocketTimeout:
 
     connect: float
     read: float
+
+
+@dataclasses.dataclass
+class FetchLiteralChunk:
+    """A single chunk of a literal streamed by :py:meth:`.IMAPClient.fetch_stream`.
+
+    :ivar seq: the message sequence number reported by the server.
+    :ivar uid: the message UID, or ``None`` if the server had not sent
+        one for this message before the literal started (servers may
+        place the UID data item after the literal in a FETCH response).
+    :ivar section: the FETCH data item the literal belongs to, for
+        example ``b"BODY[1]"`` or ``b"RFC822"``.
+    :ivar offset: byte offset of this chunk within the literal. For
+        partial ``BODY[...]<origin>`` responses the offset starts at
+        the server supplied origin.
+    :ivar data: the chunk bytes (at most *chunk_size* long).
+    """
+
+    seq: int
+    uid: Optional[int]
+    section: bytes
+    offset: int
+    data: bytes
 
 
 @dataclasses.dataclass
@@ -1409,6 +1450,184 @@ class IMAPClient:
             for message_id in to_ints(messages)
             if message_id in response
         }
+
+    def fetch_stream(self, messages, data, modifiers=None, chunk_size=65536):
+        """Stream literal FETCH data (eg. large attachments) for one or
+        more *messages* without buffering whole literals in memory.
+
+        *messages*, *data* and *modifiers* behave exactly as for
+        :py:meth:`.fetch`. Unlike :py:meth:`.fetch`, this method is a
+        generator: each literal in the FETCH response is read from the
+        server in pieces of at most *chunk_size* bytes and handed to
+        the caller as :py:class:`FetchLiteralChunk` instances carrying
+        the message sequence number, UID, section and offset metadata.
+
+        Literal content is always read according to its declared size,
+        so bytes that merely look like IMAP protocol responses (tagged
+        replies, untagged responses, literal markers) are passed
+        through as data.
+
+        Non-literal FETCH data items (eg. FLAGS) and unrelated
+        untagged responses received while streaming are discarded.
+
+        If the caller stops consuming the generator before it is
+        exhausted (eg. by breaking out of the loop and closing it),
+        the remainder of the command response is explicitly drained so
+        that no attachment fragments can leak into the next command.
+        If draining fails, the connection is closed instead.
+
+        Example::
+
+            >>> for chunk in c.fetch_stream(3293, ["BODY[1]"]):
+            ...     out.write(chunk.data)
+        """
+        if not messages:
+            return
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be a positive integer")
+
+        args = [
+            "FETCH",
+            join_message_ids(messages),
+            seq_to_parenstr_upper(data),
+            seq_to_parenstr_upper(modifiers) if modifiers else None,
+        ]
+        if self.use_uid:
+            args.insert(0, "UID")
+        tag = self._imap._command(*args)
+
+        stream = self._iter_fetch_literals(tag, chunk_size)
+        typ = data_out = None
+        try:
+            while True:
+                try:
+                    chunk = next(stream)
+                except StopIteration as stop:
+                    typ, data_out = stop.value
+                    break
+                yield chunk
+        except GeneratorExit:
+            # The caller stopped consuming early: explicitly drain the
+            # rest of this command's response (or close the connection
+            # if that fails) so the next command is not polluted with
+            # attachment fragments.
+            self._abort_fetch_stream(tag)
+            raise
+        except Exception:
+            # The stream broke mid-response. The connection state is
+            # unknown, so close it rather than risk leaking literal
+            # fragments into the next command.
+            self._shutdown_broken_stream()
+            raise
+        self._checkok("fetch", typ, data_out)
+
+    def _iter_fetch_literals(self, tag, chunk_size):
+        """Yield FetchLiteralChunk for each literal in the response to
+        the FETCH command tagged *tag*.
+
+        Returns the (typ, data) of the tagged completion response.
+        """
+        tag_prefix = to_bytes(tag) + b" "
+        while True:
+            line = self._readline_or_abort()
+            if line.startswith(tag_prefix):
+                typ, _, text = line[len(tag_prefix) :].rstrip(b"\r\n").partition(b" ")
+                return to_unicode(typ), [text]
+            if not _RE_FETCH_SEQ.match(line):
+                # Not a FETCH response (eg. unsolicited EXISTS): skip
+                # it, consuming any literals it may carry.
+                self._discard_line_literals(line)
+                continue
+            for chunk in self._stream_fetch_line(line, chunk_size):
+                yield chunk
+
+    def _stream_fetch_line(self, line, chunk_size):
+        """Yield chunks for every literal in one logical FETCH response
+        (a response line plus its literal continuations)."""
+        seq = int(_RE_FETCH_SEQ.match(line).group("seq"))
+        uid = None
+        header = line
+        while True:
+            if uid is None:
+                uid_match = _RE_FETCH_UID.search(header)
+                if uid_match:
+                    uid = int(uid_match.group("uid"))
+            tail = _RE_FETCH_LITERAL_TAIL.search(header)
+            if tail is None:
+                return
+            section = tail.group("section")
+            origin = tail.group("origin")
+            offset = int(origin) if origin else 0
+            remaining = int(tail.group("size"))
+            while remaining:
+                data = self._imap.read(min(chunk_size, remaining))
+                if not data:
+                    raise exceptions.IMAPClientAbortError(
+                        "connection lost while streaming fetch literal"
+                    )
+                remaining -= len(data)
+                yield FetchLiteralChunk(
+                    seq=seq, uid=uid, section=section, offset=offset, data=data
+                )
+                offset += len(data)
+            # The literal is followed by the rest of the response line.
+            header = self._readline_or_abort()
+
+    def _readline_or_abort(self):
+        line = self._imap.readline()
+        if not line:
+            raise exceptions.IMAPClientAbortError(
+                "connection lost while streaming fetch response"
+            )
+        return line
+
+    def _discard_line_literals(self, line):
+        """Consume any literals carried by the response *line* (and its
+        continuation lines) without yielding their content."""
+        while True:
+            match = _RE_LITERAL_END.search(line)
+            if not match:
+                return
+            self._discard_literal(int(match.group("size")))
+            line = self._readline_or_abort()
+
+    def _discard_literal(self, size):
+        remaining = size
+        while remaining:
+            data = self._imap.read(min(remaining, 65536))
+            if not data:
+                raise exceptions.IMAPClientAbortError(
+                    "connection lost while discarding fetch literal"
+                )
+            remaining -= len(data)
+
+    def _abort_fetch_stream(self, tag):
+        """Drain the remaining response for *tag* after the caller
+        stopped consuming a streaming fetch early.
+
+        If draining fails for any reason the connection is closed so
+        that no attachment fragments can leak into the next command.
+        """
+        try:
+            tag_prefix = to_bytes(tag) + b" "
+            while True:
+                line = self._readline_or_abort()
+                if line.startswith(tag_prefix):
+                    return
+                self._discard_line_literals(line)
+        except Exception as e:
+            logger.warning(
+                "Could not drain interrupted fetch response (%s); "
+                "closing connection",
+                e,
+            )
+            self._shutdown_broken_stream()
+
+    def _shutdown_broken_stream(self):
+        try:
+            self.shutdown()
+        except Exception as e:
+            logger.info("Could not close broken connection cleanly: %s", e)
 
     def append(self, folder, msg, flags=(), msg_time=None):
         """Append a message to *folder*.
